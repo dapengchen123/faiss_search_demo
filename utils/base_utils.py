@@ -245,3 +245,87 @@ def search_neighbor(query, target=None, topk=32, sort=True, algorithm=None, norm
         raise NotImplementedError
 
     return similarity, neighbor
+
+
+############### aggregation ################
+
+def feature_aggregation(feat, aggr_topk=32, aggr_th=0.6, beta=0.5, verbose=False):
+    """ Feature aggregation
+    """
+    assert beta < 1
+    feat = L2_normalize_numpy(feat, verbose=verbose)
+    similarity, neighbor = search_neighbor(query=feat, topk=aggr_topk, sort=False, normed=True, verbose=verbose)
+    aggr_feat = neighbor_aggregation(feat, similarity, neighbor, beta=beta, aggr_topk=aggr_topk,
+                                     aggr_th=aggr_th, verbose=verbose)
+    del feat
+    return aggr_feat
+
+
+def neighbor_aggregation(feat, similarity, neighbor, beta=0.5, aggr_topk=32, aggr_th=0.6,
+                         process_unit=1000, direct_average=True, verbose=False):
+    """ Feature aggregation
+    Aggregation function
+    $$ X_i^{L+1}  =  \alpha  *  X^L_i  + (1 - \alpha) *  \sum_{j \in knn(i)}( w_{i,j} * X^L_j), $$
+    where,
+    $$ w_{i,j} = \frac{ cosine(X_i, X_j) }{ \sum_{ k \in knn(i) } {cosine(X_i, X_k)} }. $$
+
+    Args:
+    aggregation parameters.
+
+    Returns:
+    Aggregated feature
+    """
+
+    if verbose: start_time = time.time()
+
+    # find affinity of topk, the first one is itself
+    weight = similarity[:, 1:aggr_topk+1]
+    neighbor = neighbor[:, 1:aggr_topk+1]
+    if direct_average:
+        weight = (weight >= aggr_th).astype(np.float32)
+    else:
+        weight = np.where(weight >= aggr_th, weight, 0.)
+
+    # normalize weight
+    weight_row_sum = np.sum(weight, axis=1, keepdims=True)
+    weight_row_sum[weight_row_sum <= 0] = 1
+    weight /= weight_row_sum
+
+    weight = torch.from_numpy(weight)
+    neighbor = torch.from_numpy(neighbor)
+    feat = torch.from_numpy(feat)
+    aggr_feat = torch.zeros_like(feat)
+
+    # https://pytorch.org/docs/stable/torch.html#torch.baddbmm
+    for s in tqdm(range(0, feat.shape[0], process_unit), desc='aggregating...', disable=not verbose):
+        e = min(feat.shape[0], s+process_unit)
+        torch.baddbmm(feat[s:e].unsqueeze(1), weight[s:e].unsqueeze(1), feat[neighbor[s:e]],
+                      beta=1-beta, alpha=beta, out=aggr_feat[s:e])
+    aggr_feat = aggr_feat.numpy()
+    aggr_feat = L2_normalize_numpy(aggr_feat)
+
+    if verbose: print(f'Time of neighbor aggregation: {time.time() - start_time} s')
+    return aggr_feat
+
+
+def GCN_aggregation(tmp_feat, num_layers=2, aggr_topk=32, aggr_th=0.6, beta=0.5, verbose=True):
+    for layer in range(0, num_layers):
+        tmp_feat = feature_aggregation(tmp_feat, aggr_topk=aggr_topk, aggr_th=aggr_th, beta=beta, verbose=verbose)
+    return tmp_feat
+
+
+######### build edges ############
+def edge_generator(similarity, neighbor, threshold=0.6, MinPts=2):
+    u, v = [], []
+    for i in range(similarity.shape[0]):
+        sim, nbr = similarity[i], neighbor[i]
+        idx = (sim > threshold).nonzero()[0]
+        if len(idx) < MinPts:
+            continue
+        for j in idx:
+            if nbr[j] != i:
+                u.append(i)
+                v.append(nbr[j])
+    return np.array([u, v]).T
+
+
